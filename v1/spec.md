@@ -66,7 +66,7 @@ The extension requires `oid4vpVersions` parameter that explicitly specifies OID4
 ## Data Structure: Authorization Request
 
 The A2A Authorization Request object is passed from Server Agent to the Client to initiate OID4VP flow, data structure is defined according to [Section 5 of OID4VP specification](https://openid.net/specs/openid-4-verifiable-presentations-1_0.html#name-authorization-request).
-It's included in the `metadata` map of a core A2A message structure as a top-level `authorizationRequest` object.
+It's included in the `metadata` map of a core A2A message structure, keyed by the extension URI, as a top-level `authorizationRequest` object within that entry.
 
 | Field             | Type     | Required                                                         | Description                                                                        |
 |:------------------|:---------|:-----------------------------------------------------------------|:-----------------------------------------------------------------------------------|
