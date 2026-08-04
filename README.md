@@ -17,6 +17,7 @@ Suggested integration provides clear protocol boundaries that set minimal restri
 
 The full specification (v1 Draft) can be found [here](./v1/spec.md).
 
-## Sample Implementation
+## Reference Implementations
 
-A sample implementation of the OID4VP In-Task Authorization Extension can be found [here](./sample).
+- [Sample implementation](./sample)
+- [A2A + OID4VP Integration Demo in Heka Identity Platform](https://github.com/hiero-ledger/heka-identity-platform/tree/main/demo/a2a-oid4vp) (LFDT Hiero project)

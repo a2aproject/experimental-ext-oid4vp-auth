@@ -19,11 +19,15 @@ The following mapping applies for roles/parties described in extension spec:
 
 For simplicity, OID4VP Wallet and OID4VP Verifier roles are integrated into A2A Client and A2A Server correspondingly.
 
-1.  **Task Initiation**: A user sends a message to the Sample Agent via the A2A CLI.
-2.  **Authorization Request**: The Sample Agent determines that the context/task requires authorization. It sends a `status-update` with the `auth-required` state, including OID4VP authorization request metadata.
-3.  **In-Task Authorization**: The CLI client (acting as a holder) detects the OID4VP request, resolves it, and prompts the user's internal wallet (represented by Credo in the CLI) to present the requested credentials.
-4.  **Verification**: The Sample Agent (acting as a verifier) receives and validates the presentation.
-5.  **Task Execution**: Once authorized, the Sample Agent proceeds with the task and generates a response.
+1.  **Extension Activation**: The CLI client declares the extension URI in the `A2A-Extensions` header on every request, and the Sample Agent activates it for the call. The extension is optional on the agent card, so a client that does not declare it is warned that it will not understand the authorization request.
+2.  **Task Initiation**: A user sends a message to the Sample Agent via the A2A CLI.
+3.  **Authorization Request**: The Sample Agent determines that the context/task requires authorization. It sends a status update with the `auth-required` state, including OID4VP authorization request metadata keyed by the extension URI.
+4.  **In-Task Authorization**: The CLI client (acting as a holder) detects the OID4VP request, resolves it, and prompts the user's internal wallet (represented by Credo in the CLI) to present the requested credentials.
+5.  **Verification**: The Sample Agent (acting as a verifier) receives and validates the presentation.
+6.  **Task Execution**: Once authorized, the Sample Agent proceeds with the task and generates a response.
+
+Note that `auth-required` is not a terminal state in A2A 1.x, so the agent's event stream stays open
+across step 4 and the same task resumes once the credential has been presented out of band.
 
 ## Running the Sample
 
@@ -54,18 +58,23 @@ cp .env.example .env
 In one terminal, start the Sample Agent:
 
 ```bash
-npm run agent
+pnpm run agent
 ```
 
-The agent will start an A2A server (port 3000) and an OID4VP verifier server (port 3001).
+The agent will start an A2A server (port 10003) and an OID4VP verifier server (port 3001).
+Both ports, and the authorization timeout, can be overridden via `SAMPLE_AGENT_PORT`,
+`SAMPLE_AGENT_VERIFIER_PORT` and `SAMPLE_AGENT_AUTH_TIMEOUT_MS`.
 
 ### 4. Run the CLI Client
 
 In a separate terminal, start the A2A CLI:
 
 ```bash
-npm run client
+pnpm run client
 ```
+
+The client connects to `http://localhost:10003` by default, but you can pass a different base URL as the
+first argument to point it elsewhere.
 
 You can now interact with the agent. The first message you send will trigger the OID4VP authorization flow.
 

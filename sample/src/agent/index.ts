@@ -5,17 +5,18 @@
  */
 
 import express, { Express } from 'express'
-import { v4 as uuidv4 } from 'uuid'
-import { AgentCard, Message, TaskStatusUpdateEvent, TextPart } from '@a2a-js/sdk'
+import { A2A_PROTOCOL_VERSION, AGENT_CARD_PATH, AgentCard, Role, Task, TaskState } from '@a2a-js/sdk'
 import {
+  AgentEvent,
   AgentExecutor,
+  DefaultExecutionEventBusManager,
   DefaultRequestHandler,
   ExecutionEventBus,
   InMemoryTaskStore,
   RequestContext,
   TaskStore,
 } from '@a2a-js/sdk/server'
-import { A2AExpressApp } from '@a2a-js/sdk/server/express'
+import { agentCardHandler, jsonRpcHandler, UserBuilder } from '@a2a-js/sdk/server/express'
 import { MessageData } from 'genkit'
 import { ai } from './genkit.js'
 
@@ -40,28 +41,38 @@ import {
   InTaskOpenId4VpExtension,
   InTaskOpenId4VpMessageMetadata,
 } from '../extension'
+import { agentText, bindOrExit, partsToText, requireEnv, statusEvent, textPart, uuid } from '../a2a-helpers'
 
 dotenv.config()
 
-if (!process.env.OPENAI_API_KEY) {
-  console.error('OPENAI_API_KEY environment variable is not set.')
-  throw new Error('OPENAI_API_KEY environment variable is not set.')
-}
+requireEnv('OPENAI_API_KEY')
+
+const SAMPLE_AGENT_PORT = Number(process.env.SAMPLE_AGENT_PORT) || 10003
+const VERIFIER_PORT = Number(process.env.SAMPLE_AGENT_VERIFIER_PORT) || 3001
+
+// How long the agent waits for the user to present a credential before failing the task
+const AUTH_TIMEOUT_MS = Number(process.env.SAMPLE_AGENT_AUTH_TIMEOUT_MS) || 120000
 
 const SAMPLE_AGENT_CARD: AgentCard = {
   name: 'Sample Agent',
   description: 'A sample agent that can answer questions about decentralized identity.',
-  url: 'http://localhost:10003/',
+  supportedInterfaces: [
+    {
+      protocolBinding: 'JSONRPC',
+      protocolVersion: A2A_PROTOCOL_VERSION,
+      url: `http://localhost:${SAMPLE_AGENT_PORT}/`,
+      tenant: '',
+    },
+  ],
   provider: {
     organization: 'A2A Samples',
     url: 'https://example.com/a2a-samples',
   },
   version: '1.0.0',
-  protocolVersion: '1.0',
   capabilities: {
     streaming: true,
     pushNotifications: false,
-    stateTransitionHistory: false,
+    extendedAgentCard: false,
     extensions: [
       {
         uri: IN_TASK_OID4VP_EXTENSION_URI,
@@ -71,8 +82,6 @@ const SAMPLE_AGENT_CARD: AgentCard = {
       } satisfies InTaskOpenId4VpExtension,
     ],
   },
-  securitySchemes: undefined,
-  security: undefined,
   defaultInputModes: ['text'],
   defaultOutputModes: ['text'],
   skills: [
@@ -84,9 +93,12 @@ const SAMPLE_AGENT_CARD: AgentCard = {
       examples: ['What is OID4VP?'],
       inputModes: ['text'],
       outputModes: ['text'],
+      securityRequirements: [],
     },
   ],
-  supportsAuthenticatedExtendedCard: false,
+  securitySchemes: {},
+  securityRequirements: [],
+  signatures: [],
 }
 
 const sampleAgentPrompt = ai.prompt('sample_agent')
@@ -105,12 +117,13 @@ const DCQL_QUERY = {
 class SampleAgentExecutor implements AgentExecutor {
   private readonly cancelledTasks = new Set<string>()
   private readonly authorizedContexts = new Set<string>()
+  private readonly authWaiters = new Map<string, () => void>()
 
   private readonly credoExpressApp: Express = express()
   private readonly credoAgent: CredoAgentWithOpenId4Vc
 
   constructor() {
-    this.credoAgent = createCredoAgent('sample-agent', this.credoExpressApp, 3001)
+    this.credoAgent = createCredoAgent('sample-agent', this.credoExpressApp, VERIFIER_PORT)
   }
 
   public async initialize(): Promise<void> {
@@ -122,204 +135,179 @@ class SampleAgentExecutor implements AgentExecutor {
       OpenId4VcVerifierEvents.VerificationSessionStateChanged,
       this.onOid4VcVerificationSessionStateChange.bind(this)
     )
-    this.credoExpressApp.listen(3001)
+
+    // A stale process on this port would silently serve the wrong verifier and 404 every presentation.
+    bindOrExit(this.credoExpressApp, VERIFIER_PORT, 'SampleAgent', () => {
+      console.log(`[SampleAgent] OID4VP verifier listening on http://localhost:${VERIFIER_PORT}/oid4vp`)
+    })
   }
 
-  public cancelTask = async (taskId: string, eventBus: ExecutionEventBus): Promise<void> => {
+  public cancelTask = async (taskId: string): Promise<void> => {
     this.cancelledTasks.add(taskId)
   }
 
   public async execute(requestContext: RequestContext, eventBus: ExecutionEventBus): Promise<void> {
     const userMessage = requestContext.userMessage
-    let task = requestContext.task
+    const existingTask = requestContext.task
 
-    const taskId = task?.id || uuidv4()
-    const contextId = userMessage.contextId || task?.contextId || uuidv4()
+    const taskId = requestContext.taskId
+    const contextId = requestContext.contextId
 
     console.log(
       `[SampleAgentExecutor] Processing message ${userMessage.messageId} for task ${taskId} (context: ${contextId})`
     )
 
-    if (!task) {
-      task = {
-        kind: 'task',
-        id: taskId,
-        contextId,
-        status: {
-          state: 'submitted',
-          timestamp: new Date().toISOString(),
-        },
-        history: [userMessage],
-        metadata: userMessage.metadata,
-      }
-      eventBus.publish(task)
+    if (requestContext.context.requestedExtensions?.includes(IN_TASK_OID4VP_EXTENSION_URI)) {
+      requestContext.context.addActivatedExtension(IN_TASK_OID4VP_EXTENSION_URI)
+    } else {
+      console.warn(
+        `[SampleAgentExecutor] Client did not request ${IN_TASK_OID4VP_EXTENSION_URI}, so it will not understand the authorization request.`
+      )
     }
 
-    if (!this.authorizedContexts.has(contextId)) {
-      const authorizationRequest = await this.createAuthorizationRequestForContext(contextId)
-
-      const authRequiredStatusUpdate: TaskStatusUpdateEvent = {
-        kind: 'status-update',
-        taskId,
-        contextId,
-        status: {
-          state: 'auth-required',
-          message: {
-            kind: 'message',
-            role: 'agent',
-            messageId: uuidv4(),
-            parts: [{ kind: 'text', text: 'Additional authorization is required for this task.' }],
-            taskId,
-            contextId,
-            metadata: {
-              [IN_TASK_OID4VP_EXTENSION_URI]: {
-                authorizationRequest,
-              } satisfies InTaskOpenId4VpMessageMetadata,
-            },
-          },
-          timestamp: new Date().toISOString(),
-        },
-        final: false,
-      }
-
-      eventBus.publish(authRequiredStatusUpdate)
-      await this.waitForContextAuthorization(contextId)
-    }
-
-    const workingStatusUpdate: TaskStatusUpdateEvent = {
-      kind: 'status-update',
-      taskId,
+    const task: Task = existingTask ?? {
+      id: taskId,
       contextId,
       status: {
-        state: 'working',
-        message: {
-          kind: 'message',
-          role: 'agent',
-          messageId: uuidv4(),
-          parts: [{ kind: 'text', text: 'Thinking...' }],
-          taskId,
-          contextId,
-        },
+        state: TaskState.TASK_STATE_SUBMITTED,
+        message: undefined,
         timestamp: new Date().toISOString(),
       },
-      final: false,
+      artifacts: [],
+      history: [userMessage],
+      metadata: userMessage.metadata,
     }
-    eventBus.publish(workingStatusUpdate)
+    eventBus.publish(AgentEvent.task(task))
 
-    const historyForGenkit = task?.history ? [...task.history] : []
-    if (!historyForGenkit.find((m) => m.messageId === userMessage.messageId)) {
-      historyForGenkit.push(userMessage)
+    if (!this.authorizedContexts.has(contextId)) {
+      try {
+        await this.requestAndAwaitAuthorization(taskId, contextId, eventBus)
+      } catch (error: unknown) {
+        const reason = error instanceof Error ? error.message : 'authorization did not complete'
+        console.error(`[SampleAgentExecutor] Authorization failed for context ${contextId}:`, error)
+        eventBus.publish(
+          AgentEvent.statusUpdate(
+            statusEvent(
+              taskId,
+              contextId,
+              TaskState.TASK_STATE_FAILED,
+              agentText(taskId, contextId, `Authorization was not completed (${reason}).`)
+            )
+          )
+        )
+        return
+      }
     }
 
-    const messages: MessageData[] = historyForGenkit
+    eventBus.publish(
+      AgentEvent.statusUpdate(
+        statusEvent(taskId, contextId, TaskState.TASK_STATE_WORKING, agentText(taskId, contextId, 'Thinking...'))
+      )
+    )
+
+    const history = existingTask?.history ? [...existingTask.history] : []
+    if (!history.some((message) => message.messageId === userMessage.messageId)) {
+      history.push(userMessage)
+    }
+
+    const messages: MessageData[] = history
       .map((message) => ({
-        role: (message.role === 'agent' ? 'model' : 'user') as 'user' | 'model',
-        content: message.parts
-          .filter((part): part is TextPart => part.kind === 'text' && !!part.text)
-          .map((part) => ({
-            text: part.text,
-          })),
+        role: (message.role === Role.ROLE_AGENT ? 'model' : 'user') as 'user' | 'model',
+        content: [{ text: partsToText(message.parts) }].filter((part) => part.text.length > 0),
       }))
       .filter((message) => message.content.length > 0)
 
     if (messages.length === 0) {
       console.warn(`[SampleAgentExecutor] No valid text messages found in history for task ${taskId}.`)
-      const failureUpdate: TaskStatusUpdateEvent = {
-        kind: 'status-update',
-        taskId,
-        contextId,
-        status: {
-          state: 'failed',
-          message: {
-            kind: 'message',
-            role: 'agent',
-            messageId: uuidv4(),
-            parts: [{ kind: 'text', text: 'No messages found to process.' }],
+      eventBus.publish(
+        AgentEvent.statusUpdate(
+          statusEvent(
             taskId,
             contextId,
-          },
-          timestamp: new Date().toISOString(),
-        },
-        final: true,
-      }
-      eventBus.publish(failureUpdate)
+            TaskState.TASK_STATE_FAILED,
+            agentText(taskId, contextId, 'No messages found to process.')
+          )
+        )
+      )
       return
     }
 
     try {
-      const response = await sampleAgentPrompt(
-        {},
-        {
-          messages,
-        }
-      )
+      const response = await sampleAgentPrompt({}, { messages })
 
       if (this.cancelledTasks.has(taskId)) {
         console.log(`[SampleAgentExecutor] Request cancelled for task: ${taskId}`)
-
-        const cancelledUpdate: TaskStatusUpdateEvent = {
-          kind: 'status-update',
-          taskId,
-          contextId,
-          status: {
-            state: 'canceled',
-            timestamp: new Date().toISOString(),
-          },
-          final: true,
-        }
-        eventBus.publish(cancelledUpdate)
+        eventBus.publish(
+          AgentEvent.statusUpdate(statusEvent(taskId, contextId, TaskState.TASK_STATE_CANCELED, undefined))
+        )
         return
       }
 
       const responseText = response.text
       console.info(`[SampleAgentExecutor] Prompt response: ${responseText}`)
 
-      const agentMessage: Message = {
-        kind: 'message',
-        role: 'agent',
-        messageId: uuidv4(),
-        parts: [{ kind: 'text', text: responseText || 'Completed.' }],
-        taskId,
-        contextId,
-      }
-
-      const finalUpdate: TaskStatusUpdateEvent = {
-        kind: 'status-update',
-        taskId,
-        contextId,
-        status: {
-          state: 'completed',
-          message: agentMessage,
-          timestamp: new Date().toISOString(),
-        },
-        final: true,
-      }
-      eventBus.publish(finalUpdate)
+      eventBus.publish(
+        AgentEvent.statusUpdate(
+          statusEvent(
+            taskId,
+            contextId,
+            TaskState.TASK_STATE_COMPLETED,
+            agentText(taskId, contextId, responseText || 'Completed.')
+          )
+        )
+      )
 
       console.log(`[SampleAgentExecutor] Task ${taskId} finished with state: completed`)
     } catch (error: unknown) {
       console.error(`[SampleAgentExecutor] Error processing task ${taskId}:`, error)
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
-      const errorUpdate: TaskStatusUpdateEvent = {
-        kind: 'status-update',
+      eventBus.publish(
+        AgentEvent.statusUpdate(
+          statusEvent(
+            taskId,
+            contextId,
+            TaskState.TASK_STATE_FAILED,
+            agentText(taskId, contextId, `Agent error: ${errorMessage}`)
+          )
+        )
+      )
+    }
+  }
+
+  private async requestAndAwaitAuthorization(
+    taskId: string,
+    contextId: string,
+    eventBus: ExecutionEventBus
+  ): Promise<void> {
+    const authorizationRequest = await this.createAuthorizationRequestForContext(contextId)
+
+    eventBus.publish(
+      AgentEvent.statusUpdate({
         taskId,
         contextId,
         status: {
-          state: 'failed',
+          state: TaskState.TASK_STATE_AUTH_REQUIRED,
           message: {
-            kind: 'message',
-            role: 'agent',
-            messageId: uuidv4(),
-            parts: [{ kind: 'text', text: `Agent error: ${errorMessage}` }],
-            taskId,
+            messageId: uuid(),
             contextId,
+            taskId,
+            role: Role.ROLE_AGENT,
+            parts: [textPart('Additional authorization is required for this task.')],
+            metadata: {
+              [IN_TASK_OID4VP_EXTENSION_URI]: {
+                authorizationRequest,
+              } satisfies InTaskOpenId4VpMessageMetadata,
+            },
+            extensions: [IN_TASK_OID4VP_EXTENSION_URI],
+            referenceTaskIds: [],
           },
           timestamp: new Date().toISOString(),
         },
-        final: true,
-      }
-      eventBus.publish(errorUpdate)
-    }
+        metadata: undefined,
+      })
+    )
+
+    await this.waitForContextAuthorization(contextId)
   }
 
   private async createAuthorizationRequestForContext(contextId: string): Promise<InTaskOpenId4VpAuthorizationRequest> {
@@ -359,22 +347,32 @@ class SampleAgentExecutor implements AgentExecutor {
     const { verificationSession } = event.payload
     if (verificationSession.state !== OpenId4VcVerificationSessionState.ResponseVerified) return
 
-    const contextId = verificationSession.getTag('contextId') as string | undefined
-    if (contextId) this.authorizedContexts.add(contextId)
+    const contextId = verificationSession.getTag('contextId')
+    if (typeof contextId !== 'string' || !contextId) return
+
+    this.authorizedContexts.add(contextId)
+
+    const waiter = this.authWaiters.get(contextId)
+    if (waiter) {
+      this.authWaiters.delete(contextId)
+      waiter()
+    }
   }
 
-  private async waitForContextAuthorization(contextId: string, timeoutMs: number = 10000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      setTimeout(() => reject('Authorization timeout exceeded.'), timeoutMs)
-      this.credoAgent.events.on(
-        OpenId4VcVerifierEvents.VerificationSessionStateChanged,
-        (event: OpenId4VcVerificationSessionStateChangedEvent) => {
-          const { verificationSession } = event.payload
-          if (verificationSession.state !== OpenId4VcVerificationSessionState.ResponseVerified) return
+  private waitForContextAuthorization(contextId: string, timeoutMs: number = AUTH_TIMEOUT_MS): Promise<void> {
+    if (this.authorizedContexts.has(contextId)) return Promise.resolve()
 
-          if (verificationSession.getTag('contextId') === contextId) resolve()
-        }
-      )
+    return new Promise<void>((resolve, reject) => {
+      const waiter = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      const timer = setTimeout(() => {
+        // Only clear our own waiter - a newer request for this context may have replaced it.
+        if (this.authWaiters.get(contextId) === waiter) this.authWaiters.delete(contextId)
+        reject(new Error('authorization timeout exceeded'))
+      }, timeoutMs)
+      this.authWaiters.set(contextId, waiter)
     })
   }
 }
@@ -385,16 +383,21 @@ async function main() {
 
   await agentExecutor.initialize()
 
-  const requestHandler = new DefaultRequestHandler(SAMPLE_AGENT_CARD, taskStore, agentExecutor)
+  const requestHandler = new DefaultRequestHandler(
+    SAMPLE_AGENT_CARD,
+    taskStore,
+    agentExecutor,
+    new DefaultExecutionEventBusManager()
+  )
 
-  const appBuilder = new A2AExpressApp(requestHandler)
-  const expressApp = appBuilder.setupRoutes(express())
+  const expressApp = express()
+  expressApp.use(express.json())
+  expressApp.use(`/${AGENT_CARD_PATH}`, agentCardHandler({ agentCardProvider: requestHandler }))
+  expressApp.use('/', jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }))
 
-  const PORT = process.env.SAMPLE_AGENT_PORT || 10003
-
-  expressApp.listen(PORT, () => {
-    console.log(`[SampleAgent] Server using new framework started on http://localhost:${PORT}`)
-    console.log(`[SampleAgent] Agent Card: http://localhost:${PORT}/.well-known/agent-card.json`)
+  bindOrExit(expressApp, SAMPLE_AGENT_PORT, 'SampleAgent', () => {
+    console.log(`[SampleAgent] Server started on http://localhost:${SAMPLE_AGENT_PORT}`)
+    console.log(`[SampleAgent] Agent Card: http://localhost:${SAMPLE_AGENT_PORT}/${AGENT_CARD_PATH}`)
     console.log('[SampleAgent] Press Ctrl+C to stop the server')
   })
 }
