@@ -276,10 +276,24 @@ async function handleAuthRequest(credoAgent: CredoAgentWithOpenId4Vc, event: Tas
     return false
   }
 
+  const { authorizationRequest } = extensionMetadata
+
+  // The spec allows an inline `request` object instead of `request_uri`; this sample only
+  // implements the `request_uri` variant.
+  if (!authorizationRequest.request_uri) {
+    console.log(
+      colorize(
+        'yellow',
+        'The agent sent an inline `request` object, but this sample only supports the `request_uri` variant. Skipping...'
+      )
+    )
+    return false
+  }
+
   console.log(colorize('green', `Agent requested additional authorization.`))
 
   const resolvedAuthorizationRequest = await credoAgent.openid4vc.holder.resolveOpenId4VpAuthorizationRequest(
-    extensionMetadata.authorizationRequest.request_uri
+    authorizationRequest.request_uri
   )
   const credentialsToShare = credoAgent.openid4vc.holder.selectCredentialsForDcqlRequest(
     resolvedAuthorizationRequest.dcql.queryResult
